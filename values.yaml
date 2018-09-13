@@ -1,0 +1,16 @@
+image: "sorintlab/stolon"
+
+imageTag: "master-pg9.6"
+
+alpine:
+  image: "polykube/alpine-kubectl"
+  imageTag: "v1.8.6"
+
+makeCerts:
+  image: "polykube/make-etcd-certs"
+  imageTag: "0.3.0"
+
+etcd:
+  image: "quay.io/coreos/etcd"
+  imageTag: "v3.3.9"
+  secure: true

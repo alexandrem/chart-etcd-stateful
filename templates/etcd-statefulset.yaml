@@ -1,0 +1,382 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: etcd-certs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: etcd-certs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: etcd-certs
+subjects:
+- kind: ServiceAccount
+  name: etcd-certs
+  namespace: {{.Release.Namespace}}
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: etcd-certs
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "delete"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etcd-certs-cfg
+data:
+  etcd-certs.yaml: ""
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: etcd-server-tls
+data:
+  server-ca.crt: ""
+  server.crt: ""
+  server.key: ""
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: etcd-peer-tls
+data:
+  peer-ca.crt: ""
+  peer.crt: ""
+  peer.key: ""
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: "etcd"
+  annotations:
+    # Create endpoints also if the related pod isn't ready
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  ports:
+  - port: 2379
+    name: client
+  - port: 2380
+    name: peer
+  clusterIP: None
+  selector:
+    app: etcd
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: etcd-init
+  labels:
+    app: etcd-init
+spec:
+  template:
+    metadata:
+      labels:
+        app: etcd-init
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: etcd-certs
+      initContainers:
+        - name: prepare-certs
+          image: "{{.Values.alpine.image}}:{{.Values.alpine.imageTag}}"
+          command:
+            - /bin/sh
+            - -xc
+            - |
+              cp /current-etcd-peer-tls/* /certs/ || true
+              cp /current-etcd-server-tls/* /certs/ || true
+
+              cat <<EOF > /cfg/etcd-certs.yaml
+              server:
+                hosts:
+                  - "127.0.0.1"
+                  - "etcd"
+                  - "etcd.etcd"
+                  - "etcd-0.etcd"
+                  - "etcd-1.etcd"
+                  - "etcd-2.etcd"
+                  - "etcd-0.etcd.$(MY_POD_NAMESPACE).svc"
+                  - "etcd-1.etcd.$(MY_POD_NAMESPACE).svc"
+                  - "etcd-2.etcd.$(MY_POD_NAMESPACE).svc"
+                  - "etcd-0.etcd.$(MY_POD_NAMESPACE).svc.cluster.local"
+                  - "etcd-1.etcd.$(MY_POD_NAMESPACE).svc.cluster.local"
+                  - "etcd-2.etcd.$(MY_POD_NAMESPACE).svc.cluster.local"
+                  - "*.etcd"
+                  - "*.etcd.$(MY_POD_NAMESPACE).svc"
+                  - "*.etcd.$(MY_POD_NAMESPACE).svc.cluster.local"
+              peer:
+                hosts:
+                  - "etcd-0.etcd"
+                  - "etcd-1.etcd"
+                  - "etcd-2.etcd"
+                  - "*.etcd"
+                  - "*.etcd.$(MY_POD_NAMESPACE).svc"
+                  - "*.etcd.$(MY_POD_NAMESPACE).svc.cluster.local"
+              EOF
+
+              # we store the generated certs config for future introspection
+              kubectl delete configmap etcd-certs-cfg || true
+              kubectl create configmap etcd-certs-cfg --from-file=etcd-certs.yaml="/cfg/etcd-certs.yaml"
+
+          env:
+            - name: MY_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: current-etcd-peer-tls
+              mountPath: /current-etcd-peer-tls
+            - name: current-etcd-server-tls
+              mountPath: /current-etcd-server-tls
+            - name: etcd-certs
+              mountPath: /certs
+            - name: certs-cfg
+              mountPath: /cfg
+
+        - name: make-etcd-certs
+          image: "{{.Values.makeCerts.image}}:{{.Values.makeCerts.imageTag}}"
+          volumeMounts:
+            - name: certs-cfg
+              mountPath: /input
+              # scratch place to write new certs
+            - name: etcd-certs
+              mountPath: /certs
+      containers:
+        - name: tls-secrets
+          image: "{{.Values.alpine.image}}:{{.Values.alpine.imageTag}}"
+          command:
+            - /bin/sh
+            - -xc
+            - |
+              kubectl patch secret etcd-peer-tls -p"{\"data\": {\"peer-ca.crt\": \"$(cat /certs/peer-ca.crt | base64 | sed -r '$!s/$/\\n/' | tr -d '\n')\"}}"
+              kubectl patch secret etcd-peer-tls -p"{\"data\": {\"peer.crt\": \"$(cat /certs/peer.crt | base64 | sed -r '$!s/$/\\n/' | tr -d '\n')\"}}"
+              kubectl patch secret etcd-peer-tls -p"{\"data\": {\"peer.key\": \"$(cat /certs/peer.key | base64 | sed -r '$!s/$/\\n/' | tr -d '\n')\"}}"
+
+              kubectl patch secret etcd-server-tls -p"{\"data\": {\"server-ca.crt\": \"$(cat /certs/server-ca.crt | base64 | sed -r '$!s/$/\\n/' | tr -d '\n')\"}}"
+              kubectl patch secret etcd-server-tls -p"{\"data\": {\"server.crt\": \"$(cat /certs/server.crt | base64 | sed -r '$!s/$/\\n/' | tr -d '\n')\"}}"
+              kubectl patch secret etcd-server-tls -p"{\"data\": {\"server.key\": \"$(cat /certs/server.key | base64 | sed -r '$!s/$/\\n/' | tr -d '\n')\"}}"
+
+          volumeMounts:
+            - name: etcd-certs
+              mountPath: /certs
+      volumes:
+        - name: etcd-certs
+          emptyDir: {}
+        - name: certs-cfg
+          emptyDir: {}
+        - name: current-etcd-server-tls
+          secret:
+            secretName: etcd-server-tls
+        - name: current-etcd-peer-tls
+          secret:
+            secretName: etcd-peer-tls
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+  labels:
+    app: etcd
+spec:
+  serviceName: etcd
+  replicas: 3
+  selector:
+    matchLabels:
+      app: etcd
+  template:
+    metadata:
+      name: "etcd"
+      labels:
+        app: etcd
+    spec:
+      terminationGracePeriodSeconds: 60
+      restartPolicy: Always     
+      containers:
+      - name: etcd-wait
+        image: alpine
+        command:
+        - /bin/sh
+        - -xc
+        - |
+          if [ $(ETCD_TLS) -eq "true" ]; then
+            crt=/etc/etcdtls/peer/peer.crt
+            [ -f $crt ] || exit 1
+            [ ! -z "$(cat $crt)" ] || exit 1
+            crt=/etc/etcdtls/server/server.crt
+            [ -f $crt ] || exit 1
+            [ ! -z "$(cat $crt)" ] || exit 1
+            echo "cert files are ready!"
+          fi
+          while :; do sleep 30; done
+        env:
+        - name: ETCD_TLS
+          value: "{{.Values.etcd.secure}}"
+        volumeMounts:
+        - name: etcd-peer-tls
+          mountPath: /etc/etcdtls/peer
+          readOnly: true
+        - name: etcd-server-tls
+          mountPath: /etc/etcdtls/server
+          readOnly: true
+      - name: "etcd"
+        image: "{{.Values.etcd.image}}:{{.Values.etcd.imageTag}}"
+        ports:
+        - containerPort: 2379
+          name: client
+        - containerPort: 2380
+          name: peer
+        env:
+        - name: CLUSTER_SIZE
+          value: "3"
+        - name: SET_NAME
+          value: "etcd"
+        - name: ETCDCTL_API
+          value: "3"
+        - name: ETCD_TLS
+          value: "{{.Values.etcd.secure}}"
+        volumeMounts:
+        - name: data
+          mountPath: /var/run/etcd
+        - name: etcd-peer-tls
+          mountPath: /etc/etcdtls/peer
+          readOnly: true
+        - name: etcd-server-tls
+          mountPath: /etc/etcdtls/server
+          readOnly: true
+        resources:
+          limits:
+            cpu: 500m
+            memory: 768Mi
+          requests:
+            cpu: 500m
+            memory: 768Mi
+        command:
+          - "/bin/sh"
+          - "-ecx"
+          - |
+            IP=$(hostname -i)
+            for i in $(seq 0 $((${CLUSTER_SIZE} - 1))); do
+              while true; do
+                echo "Waiting for ${SET_NAME}-${i}.${SET_NAME} to come up"
+                ping -W 1 -c 1 ${SET_NAME}-${i}.${SET_NAME} > /dev/null && break
+                sleep 1s
+              done
+            done
+
+            STATE="new"
+            PEERS=""
+            CLIENT_URLS=""
+            #
+            # only needed on etcdctl if enabling authorization
+            # --cert=/etc/etcdctl/server/server.crt \
+            # --key=/etc/etcdctl/server/server.key \
+            for i in $(seq 0 $((${CLUSTER_SIZE} - 1))); do
+                if [ $(ETCD_TLS) -eq "true" ]; then
+                  PEERS="${PEERS}${PEERS:+,}${SET_NAME}-${i}=https://${SET_NAME}-${i}.${SET_NAME}:2380"
+                  CLIENT_URLS="${CLIENT_URLS}${CLIENT_URLS:+,}https://${SET_NAME}-${i}.${SET_NAME}:2379"
+                  set +e
+                  etcdctl \
+                    --endpoints=https://etcd-${i}.${SET_NAME}:2379 \
+                    --cacert=/etc/etcdctl/server/server-ca.crt \
+                    endpoint status
+                  ret=$?
+                  set -e
+                else
+                  PEERS="${PEERS}${PEERS:+,}${SET_NAME}-${i}=http://${SET_NAME}-${i}.${SET_NAME}:2380"
+                  CLIENT_URLS="${CLIENT_URLS}${CLIENT_URLS:+,}http://${SET_NAME}-${i}.${SET_NAME}:2379"
+                  set +e
+                  etcdctl \
+                    --endpoints=https://etcd-${i}.${SET_NAME}:2379 \
+                    endpoint status
+                  ret=$?
+                  set -e
+                fi
+                if [[ $ret -eq 0 ]]; then
+                    STATE="existing"
+                fi
+            done
+
+            # start etcd. If cluster is already initialized the `--initial-*` options will be ignored.
+            #
+            # This would only be needed if enabling authorization and using CN in cacert client.
+            # --client-cert-auth=true \
+            # --trusted-ca-file=/etc/etcdtls/server/server-ca.crt \
+
+            if [ $(ETCD_TLS) -eq "true" ]; then
+              exec etcd --name ${HOSTNAME} \
+                --listen-peer-urls https://${IP}:2380 \
+                --peer-client-cert-auth=true \
+                --peer-trusted-ca-file=/etc/etcdtls/peer/peer-ca.crt \
+                --peer-cert-file=/etc/etcdtls/peer/peer.crt \
+                --peer-key-file=/etc/etcdtls/peer/peer.key \
+                --cert-file=/etc/etcdtls/server/server.crt \
+                --key-file=/etc/etcdtls/server/server.key \
+                --listen-client-urls https://${IP}:2379,https://127.0.0.1:2379 \
+                --advertise-client-urls ${CLIENT_URLS} \
+                --initial-advertise-peer-urls https://${HOSTNAME}.${SET_NAME}:2380 \
+                --initial-cluster-token etcd-cluster-1 \
+                --initial-cluster ${PEERS} \
+                --initial-cluster-state ${STATE} \
+                --data-dir /var/run/etcd/default.etcd
+            else
+              exec etcd --name ${HOSTNAME} \
+                --listen-peer-urls http://${IP}:2380 \
+                --peer-client-cert-auth=false \
+                --listen-client-urls http://${IP}:2379,http://127.0.0.1:2379 \
+                --advertise-client-urls ${CLIENT_URLS} \
+                --initial-advertise-peer-urls http://${HOSTNAME}.${SET_NAME}:2380 \
+                --initial-cluster-token etcd-cluster-1 \
+                --initial-cluster ${PEERS} \
+                --initial-cluster-state ${STATE} \
+                --data-dir /var/run/etcd/default.etcd
+            fi
+
+        # Doesn't really work when we need tls certs
+        # livenessProbe:
+        #   exec:
+        #     command:
+        #     - /usr/local/bin/etcdctl
+        #     - --endpoints=https://127.0.0.1:2379
+        #     - get
+        #     - foo
+        #   # leave enough time for the peers build up
+        #   initialDelaySeconds: 60
+        #   periodSeconds: 5
+        #   timeoutSeconds: 5
+        #   failureThreshold: 3
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: "component"
+                    operator: In
+                    values: 
+                    - etcd
+              topologyKey: "kubernetes.io/hostname"
+  
+      volumes:
+      - name: etcd-peer-tls
+        secret:
+          secretName: etcd-peer-tls
+      - name: etcd-server-tls
+        secret:
+          secretName: etcd-server-tls
+
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+        - "ReadWriteOnce"
+      resources:
+        requests:
+          storage: 4Gi
